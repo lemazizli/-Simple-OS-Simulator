@@ -1,0 +1,171 @@
+import time
+from collections import deque
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Optional
+
+
+class ProcessState(Enum):
+    NEW = "NEW"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    BLOCKED = "BLOCKED"
+    TERMINATED = "TERMINATED"
+
+
+@dataclass
+class Process:
+    pid: int
+    name: str
+    burst_time: int
+    memory_required: int
+    state: ProcessState = ProcessState.NEW
+    time_executed: int = 0
+
+    def execute(self, time_slice: int) -> bool:
+        """Execute process for given time slice. Returns True if completed."""
+        execution_time = min(time_slice, self.burst_time - self.time_executed)
+        self.time_executed += execution_time
+
+        if self.time_executed >= self.burst_time:
+            self.state = ProcessState.TERMINATED
+            return True
+        return False
+
+
+class MemoryManager:
+    def __init__(self, total_memory: int):
+        self.total_memory = total_memory
+        self.allocated = {}  # pid -> memory_size
+
+    def allocate(self, pid: int, size: int) -> bool:
+        """Allocate memory to process. Returns True if successful."""
+        if self.get_free_memory() >= size:
+            self.allocated[pid] = size
+            return True
+        return False
+
+    def deallocate(self, pid: int) -> None:
+        """Deallocate memory from process."""
+        if pid in self.allocated:
+            del self.allocated[pid]
+
+    def get_free_memory(self) -> int:
+        """Get available free memory."""
+        return self.total_memory - sum(self.allocated.values())
+
+    def get_usage(self) -> float:
+        """Get memory usage percentage."""
+        return (sum(self.allocated.values()) / self.total_memory) * 100
+
+
+class CPUScheduler:
+    def __init__(self, time_slice: int = 4):
+        self.time_slice = time_slice
+        self.ready_queue = deque()
+        self.current_process: Optional[Process] = None
+        self.completed_processes: List[Process] = []
+        self.total_time = 0
+
+    def add_process(self, process: Process) -> None:
+        """Add process to ready queue."""
+        process.state = ProcessState.READY
+        self.ready_queue.append(process)
+
+    def schedule(self) -> bool:
+        """Execute one time slice. Returns True if there are still processes."""
+        # If current process is done, move to next
+        if self.current_process is None or self.current_process.state == ProcessState.TERMINATED:
+            if self.current_process and self.current_process.state == ProcessState.TERMINATED:
+                self.completed_processes.append(self.current_process)
+
+            if not self.ready_queue:
+                return False
+
+            self.current_process = self.ready_queue.popleft()
+            self.current_process.state = ProcessState.RUNNING
+
+        # Execute current process for one time slice
+        completed = self.current_process.execute(self.time_slice)
+        self.total_time += self.time_slice
+
+        # If not completed, return to ready queue
+        if not completed:
+            self.current_process.state = ProcessState.READY
+            self.ready_queue.append(self.current_process)
+
+        return True
+
+    def get_status(self) -> str:
+        """Get current scheduling status."""
+        status = f"Current Process: {self.current_process.name if self.current_process else 'None'}\n"
+        status += f"Ready Queue: {[p.name for p in self.ready_queue]}\n"
+        status += f"Total Time: {self.total_time} units\n"
+        return status
+
+
+class SimpleOS:
+    def __init__(self, memory_size: int = 1024, time_slice: int = 4):
+        self.memory_manager = MemoryManager(memory_size)
+        self.cpu_scheduler = CPUScheduler(time_slice)
+        self.pid_counter = 1
+        self.processes: dict = {}
+
+    def create_process(self, name: str, burst_time: int, memory_required: int) -> Optional[int]:
+        """Create a new process. Returns PID if successful."""
+        if self.memory_manager.allocate(self.pid_counter, memory_required):
+            process = Process(
+                pid=self.pid_counter,
+                name=name,
+                burst_time=burst_time,
+                memory_required=memory_required
+            )
+            self.processes[self.pid_counter] = process
+            self.cpu_scheduler.add_process(process)
+            pid = self.pid_counter
+            self.pid_counter += 1
+            print(f"✓ Process created: {name} (PID: {pid})")
+            return pid
+        else:
+            print(f"✗ Failed to create {name}: Insufficient memory")
+            return None
+
+    def run(self) -> None:
+        """Run the OS simulator."""
+        print("=" * 50)
+        print("Simple OS Simulator Started")
+        print("=" * 50)
+
+        while self.cpu_scheduler.schedule():
+            print(f"\n{self.cpu_scheduler.get_status()}")
+            print(f"Memory Usage: {self.memory_manager.get_usage():.1f}% "
+                  f"({self.memory_manager.total_memory - self.memory_manager.get_free_memory()}"
+                  f"/{self.memory_manager.total_memory} MB)")
+            time.sleep(0.5)  # Slow down for visualization
+
+        print("\n" + "=" * 50)
+        print("All processes completed!")
+        print("=" * 50)
+        self.print_summary()
+
+    def print_summary(self) -> None:
+        """Print execution summary."""
+        print("\nExecution Summary:")
+        for process in self.cpu_scheduler.completed_processes:
+            print(f"  {process.name}: Executed {process.time_executed} units (Burst: {process.burst_time})")
+        print(f"\nTotal Execution Time: {self.cpu_scheduler.total_time} units")
+
+
+# Main execution
+if __name__ == "__main__":
+    # Create OS with 512 MB memory and 4-unit time slice
+    os = SimpleOS(memory_size=512, time_slice=4)
+
+    # Create some processes
+    os.create_process("Process-1", burst_time=8, memory_required=128)
+    os.create_process("Process-2", burst_time=12, memory_required=96)
+    os.create_process("Process-3", burst_time=6, memory_required=110)
+    os.create_process("Process-4", burst_time=10, memory_required=150)
+
+    # Run the simulator
+    os.run()
