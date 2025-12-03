@@ -1,0 +1,522 @@
+import time
+import random
+from collections import deque
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Set, Tuple
+from abc import ABC, abstractmethod
+import threading
+
+
+class ProcessState(Enum):
+    NEW = "NEW"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    BLOCKED = "BLOCKED"
+    WAITING_IO = "WAITING_IO"
+    TERMINATED = "TERMINATED"
+
+
+class InterruptType(Enum):
+    TIMER = "TIMER"
+    IO_COMPLETE = "IO_COMPLETE"
+    PAGE_FAULT = "PAGE_FAULT"
+    SEGMENTATION_FAULT = "SEGMENTATION_FAULT"
+
+
+class IOType(Enum):
+    DISK_READ = "DISK_READ"
+    DISK_WRITE = "DISK_WRITE"
+    NETWORK = "NETWORK"
+
+
+@dataclass
+class IORequest:
+    io_id: int
+    pid: int
+    io_type: IOType
+    duration: int
+    time_created: int
+    completion_time: Optional[int] = None
+
+    def is_complete(self, current_time: int) -> bool:
+        return (current_time - self.time_created) >= self.duration
+
+
+@dataclass
+class PageTableEntry:
+    page_num: int
+    frame_num: Optional[int]
+    valid: bool
+    dirty: bool = False
+    accessed: bool = False
+
+
+@dataclass
+class Process:
+    pid: int
+    name: str
+    burst_time: int
+    memory_required: int
+    priority: int
+    state: ProcessState = ProcessState.NEW
+    time_executed: int = 0
+    time_created: int = 0
+    time_terminated: Optional[int] = None
+    page_table: Dict[int, PageTableEntry] = field(default_factory=dict)
+    open_files: Set[str] = field(default_factory=set)
+    io_requests: List[IORequest] = field(default_factory=list)
+    cpu_context: Dict = field(default_factory=dict)
+
+    def execute(self, time_slice: int) -> Tuple[bool, Optional[InterruptType]]:
+
+        if random.random() < 0.1:
+            return False, InterruptType.PAGE_FAULT
+
+        execution_time = min(time_slice, self.burst_time - self.time_executed)
+        self.time_executed += execution_time
+
+        if self.time_executed >= self.burst_time:
+            self.state = ProcessState.TERMINATED
+            return True, None
+
+        return False, None
+
+
+class VirtualMemoryManager:
+    def __init__(self, physical_memory: int, virtual_memory: int, page_size: int = 4):
+        self.physical_memory = physical_memory
+        self.virtual_memory = virtual_memory
+        self.page_size = page_size
+        self.physical_frames = {}  # frame_num -> (pid, page_num)
+        self.page_table_cache = {}  # pid -> page_table
+        self.free_frames = set(range(physical_memory // page_size))
+        self.page_faults = 0
+        self.tlb_hits = 0
+        self.tlb_misses = 0
+        self.tlb = {}  # (pid, page_num) -> frame_num
+        self.swap_space = {}  # page_num -> data (simulated)
+
+    def allocate_virtual_memory(self, pid: int, size: int) -> Dict[int, PageTableEntry]:
+        """Allocate virtual memory pages for process"""
+        num_pages = (size + self.page_size - 1) // self.page_size
+        page_table = {}
+
+        for i in range(num_pages):
+            frame_num = None
+            if self.free_frames:
+                frame_num = self.free_frames.pop()
+                self.physical_frames[frame_num] = (pid, i)
+
+            page_table[i] = PageTableEntry(
+                page_num=i,
+                frame_num=frame_num,
+                valid=(frame_num is not None)
+            )
+
+        self.page_table_cache[pid] = page_table
+        return page_table
+
+    def translate_address(self, pid: int, logical_page: int) -> Tuple[Optional[int], bool]:
+        """Translate logical page to physical frame. Returns (frame_num, was_tlb_hit)"""
+        # Check TLB first
+        tlb_key = (pid, logical_page)
+        if tlb_key in self.tlb:
+            self.tlb_hits += 1
+            return self.tlb[tlb_key], True
+
+        self.tlb_misses += 1
+
+        # Check page table
+        if pid not in self.page_table_cache:
+            return None, False
+
+        page_entry = self.page_table_cache[pid].get(logical_page)
+        if not page_entry or not page_entry.valid:
+            self.page_faults += 1
+            return None, False
+
+        # Update TLB
+        self.tlb[tlb_key] = page_entry.frame_num
+        return page_entry.frame_num, False
+
+    def handle_page_fault(self, pid: int, page_num: int) -> bool:
+        """Handle page fault. Returns True if resolved."""
+        if not self.free_frames:
+            # Evict page from memory
+            frame_to_evict = next(iter(self.physical_frames.keys()))
+            old_pid, old_page = self.physical_frames[frame_to_evict]
+            self.swap_space[old_page] = "swapped"
+            del self.physical_frames[frame_to_evict]
+            self.free_frames.add(frame_to_evict)
+
+        if self.free_frames:
+            frame_num = self.free_frames.pop()
+            self.physical_frames[frame_num] = (pid, page_num)
+
+            if pid in self.page_table_cache and page_num in self.page_table_cache[pid]:
+                self.page_table_cache[pid][page_num].frame_num = frame_num
+                self.page_table_cache[pid][page_num].valid = True
+
+            return True
+        return False
+
+    def deallocate(self, pid: int) -> None:
+        """Deallocate all memory for process"""
+        if pid in self.page_table_cache:
+            for page_num, entry in self.page_table_cache[pid].items():
+                if entry.frame_num is not None:
+                    self.free_frames.add(entry.frame_num)
+                    del self.physical_frames[entry.frame_num]
+            del self.page_table_cache[pid]
+
+    def get_memory_stats(self) -> Dict:
+        return {
+            "free_frames": len(self.free_frames),
+            "used_frames": len(self.physical_frames),
+            "page_faults": self.page_faults,
+            "tlb_hits": self.tlb_hits,
+            "tlb_misses": self.tlb_misses
+        }
+
+
+class FileSystem:
+    def __init__(self, storage_size: int = 1000):
+        self.storage_size = storage_size
+        self.files = {}  # filename -> (size, pid_owner)
+        self.open_handles = {}  # (pid, filename) -> handle_id
+        self.handle_counter = 1
+
+    def create_file(self, pid: int, filename: str, size: int) -> bool:
+        """Create file"""
+        total_used = sum(f[0] for f in self.files.values())
+        if total_used + size <= self.storage_size:
+            self.files[filename] = (size, pid)
+            return True
+        return False
+
+    def open_file(self, pid: int, filename: str) -> Optional[int]:
+        """Open file and return handle"""
+        if filename in self.files:
+            handle = self.handle_counter
+            self.open_handles[(pid, filename)] = handle
+            self.handle_counter += 1
+            return handle
+        return None
+
+    def close_file(self, pid: int, filename: str) -> bool:
+        """Close file"""
+        if (pid, filename) in self.open_handles:
+            del self.open_handles[(pid, filename)]
+            return True
+        return False
+
+    def delete_file(self, filename: str) -> bool:
+        """Delete file"""
+        if filename in self.files:
+            del self.files[filename]
+            return True
+        return False
+
+    def get_storage_stats(self) -> Dict:
+        total_used = sum(f[0] for f in self.files.values())
+        return {
+            "total_files": len(self.files),
+            "used_space": total_used,
+            "free_space": self.storage_size - total_used,
+            "usage_percent": (total_used / self.storage_size) * 100
+        }
+
+
+class InterruptHandler:
+    def __init__(self):
+        self.interrupt_queue = deque()
+        self.interrupt_count = 0
+
+    def raise_interrupt(self, interrupt_type: InterruptType, data: Dict) -> None:
+        """Raise an interrupt"""
+        self.interrupt_queue.append({
+            "type": interrupt_type,
+            "data": data,
+            "time": time.time()
+        })
+        self.interrupt_count += 1
+
+    def get_next_interrupt(self) -> Optional[Dict]:
+        """Get next interrupt to handle"""
+        if self.interrupt_queue:
+            return self.interrupt_queue.popleft()
+        return None
+
+    def has_pending_interrupts(self) -> bool:
+        return len(self.interrupt_queue) > 0
+
+
+class CPUScheduler:
+    def __init__(self, time_slice: int = 4, scheduling_algorithm: str = "round_robin"):
+        self.time_slice = time_slice
+        self.scheduling_algorithm = scheduling_algorithm
+        self.ready_queue = deque()
+        self.priority_queues = {i: deque() for i in range(5)}
+        self.current_process: Optional[Process] = None
+        self.completed_processes: List[Process] = []
+        self.total_time = 0
+        self.context_switches = 0
+        self.io_queue = deque()
+
+    def add_process(self, process: Process) -> None:
+        """Add process to appropriate queue"""
+        process.state = ProcessState.READY
+
+        if self.scheduling_algorithm == "priority":
+            self.priority_queues[process.priority].append(process)
+        else:
+            self.ready_queue.append(process)
+
+    def schedule(self, interrupt_handler: InterruptHandler) -> bool:
+        """Execute one scheduling cycle"""
+        # Handle interrupts
+        while interrupt_handler.has_pending_interrupts():
+            interrupt = interrupt_handler.get_next_interrupt()
+            self._handle_interrupt(interrupt)
+
+        if self.current_process and self.current_process.state == ProcessState.TERMINATED:
+            self.completed_processes.append(self.current_process)
+            self.current_process = None
+
+        # Select next process
+        if self.current_process is None:
+            self.current_process = self._select_next_process()
+            if self.current_process:
+                self.current_process.state = ProcessState.RUNNING
+                self.context_switches += 1
+
+        if self.current_process is None:
+            return False
+
+        # Execute for time slice
+        completed, interrupt_type = self.current_process.execute(self.time_slice)
+        self.total_time += self.time_slice
+
+        if interrupt_type:
+            interrupt_handler.raise_interrupt(interrupt_type, {"pid": self.current_process.pid})
+
+        if not completed:
+            self.current_process.state = ProcessState.READY
+            self.add_process(self.current_process)
+            self.current_process = None
+
+        return True
+
+    def _select_next_process(self) -> Optional[Process]:
+        """Select next process based on scheduling algorithm"""
+        if self.scheduling_algorithm == "priority":
+            for priority in range(5):
+                if self.priority_queues[priority]:
+                    return self.priority_queues[priority].popleft()
+        else:  # round_robin
+            if self.ready_queue:
+                return self.ready_queue.popleft()
+        return None
+
+    def _handle_interrupt(self, interrupt: Dict) -> None:
+        """Handle interrupt"""
+        if interrupt["type"] == InterruptType.TIMER:
+            pass
+        elif interrupt["type"] == InterruptType.PAGE_FAULT:
+            if self.current_process:
+                self.current_process.state = ProcessState.BLOCKED
+
+    def get_queue_length(self) -> int:
+        if self.scheduling_algorithm == "priority":
+            return sum(len(q) for q in self.priority_queues.values())
+        return len(self.ready_queue)
+
+    def get_status(self) -> str:
+        status = f"CPU: {self.current_process.name if self.current_process else 'Idle'}\n"
+        status += f"Ready Queue: {self.get_queue_length()}\n"
+        status += f"Context Switches: {self.context_switches}\n"
+        status += f"Total Time: {self.total_time}\n"
+        return status
+
+
+class IOManager:
+    def __init__(self):
+        self.io_queue = deque()
+        self.active_io = {}  # io_id -> IORequest
+        self.io_counter = 1
+        self.io_completed = 0
+
+    def request_io(self, pid: int, io_type: IOType, duration: int, current_time: int) -> int:
+        """Queue IO request"""
+        io_req = IORequest(
+            io_id=self.io_counter,
+            pid=pid,
+            io_type=io_type,
+            duration=duration,
+            time_created=current_time
+        )
+        self.io_queue.append(io_req)
+        self.io_counter += 1
+        return io_req.io_id
+
+    def process_io(self, current_time: int) -> List[int]:
+        """Process IO operations. Returns list of completed PIDs"""
+        if self.io_queue and not self.active_io:
+            req = self.io_queue.popleft()
+            self.active_io[req.io_id] = req
+
+        completed_pids = []
+        completed_io_ids = []
+
+        for io_id, req in list(self.active_io.items()):
+            if req.is_complete(current_time):
+                completed_pids.append(req.pid)
+                completed_io_ids.append(io_id)
+                self.io_completed += 1
+
+        for io_id in completed_io_ids:
+            del self.active_io[io_id]
+
+        return completed_pids
+
+    def get_stats(self) -> Dict:
+        return {
+            "pending": len(self.io_queue),
+            "active": len(self.active_io),
+            "completed": self.io_completed
+        }
+
+
+class ComplexOS:
+    def __init__(self, physical_memory: int = 256, virtual_memory: int = 1024,
+                 storage_size: int = 1000, scheduling: str = "round_robin"):
+        self.vm_manager = VirtualMemoryManager(physical_memory, virtual_memory)
+        self.fs = FileSystem(storage_size)
+        self.scheduler = CPUScheduler(time_slice=4, scheduling_algorithm=scheduling)
+        self.io_manager = IOManager()
+        self.interrupt_handler = InterruptHandler()
+        self.pid_counter = 1
+        self.processes: Dict[int, Process] = {}
+        self.current_time = 0
+        self.system_calls = 0
+
+    def create_process(self, name: str, burst_time: int, memory_required: int, priority: int = 2) -> Optional[int]:
+        """Create new process with virtual memory"""
+        page_table = self.vm_manager.allocate_virtual_memory(self.pid_counter, memory_required)
+
+        process = Process(
+            pid=self.pid_counter,
+            name=name,
+            burst_time=burst_time,
+            memory_required=memory_required,
+            priority=priority,
+            page_table=page_table,
+            time_created=self.current_time
+        )
+
+        self.processes[self.pid_counter] = process
+        self.scheduler.add_process(process)
+
+        pid = self.pid_counter
+        self.pid_counter += 1
+        print(f"✓ Process {name} created (PID: {pid}, Priority: {priority})")
+        return pid
+
+    def handle_page_fault(self, pid: int) -> None:
+        """Handle page fault for process"""
+        if pid in self.processes:
+            process = self.processes[pid]
+            page_num = random.choice(list(process.page_table.keys()))
+            if self.vm_manager.handle_page_fault(pid, page_num):
+                print(f"  [PAGE FAULT] PID {pid} - Resolved")
+            process.state = ProcessState.READY
+            self.scheduler.add_process(process)
+
+    def run(self, max_cycles: int = 200) -> None:
+        """Run OS simulator"""
+        print("=" * 70)
+        print("Complex OS Simulator - Started")
+        print(
+            f"Physical Memory: 256KB | Virtual Memory: 1024KB | Scheduling: {self.scheduler.scheduling_algorithm.upper()}")
+        print("=" * 70)
+
+        cycles = 0
+        while cycles < max_cycles and (self.scheduler.get_queue_length() > 0 or self.scheduler.current_process):
+            cycles += 1
+
+            # Process IO completions
+            completed_pids = self.io_manager.process_io(self.current_time)
+            for pid in completed_pids:
+                if pid in self.processes:
+                    self.processes[pid].state = ProcessState.READY
+                    self.scheduler.add_process(self.processes[pid])
+
+            # Main scheduling
+            if not self.scheduler.schedule(self.interrupt_handler):
+                break
+
+            # Random IO operations
+            if self.scheduler.current_process and random.random() < 0.15:
+                io_type = random.choice(list(IOType))
+                self.io_manager.request_io(
+                    self.scheduler.current_process.pid,
+                    io_type,
+                    random.randint(2, 6),
+                    self.current_time
+                )
+                self.scheduler.current_process.state = ProcessState.WAITING_IO
+
+            self.current_time += self.scheduler.time_slice
+
+            if cycles % 20 == 0:
+                self._print_status()
+
+        print("\n" + "=" * 70)
+        print("All processes completed!")
+        print("=" * 70)
+        self._print_final_report()
+
+    def _print_status(self) -> None:
+        """Print system status"""
+        print(f"\n[Time: {self.current_time}]")
+        print(self.scheduler.get_status())
+        mem_stats = self.vm_manager.get_memory_stats()
+        print(f"Memory - Page Faults: {mem_stats['page_faults']} | TLB Hits: {mem_stats['tlb_hits']}")
+        io_stats = self.io_manager.get_stats()
+        print(
+            f"IO - Pending: {io_stats['pending']} | Active: {io_stats['active']} | Completed: {io_stats['completed']}")
+        fs_stats = self.fs.get_storage_stats()
+        print(f"Storage - Usage: {fs_stats['usage_percent']:.1f}% ({fs_stats['used_space']}/{self.fs.storage_size}KB)")
+
+    def _print_final_report(self) -> None:
+        """Print detailed final report"""
+        print("\nProcess Execution Summary:")
+        for process in self.scheduler.completed_processes:
+            print(f"  {process.name} (PID: {process.pid}): Executed {process.time_executed}/{process.burst_time} units")
+
+        mem_stats = self.vm_manager.get_memory_stats()
+        print(f"\nMemory Statistics:")
+        print(f"  Total Page Faults: {mem_stats['page_faults']}")
+        print(f"  TLB Hits: {mem_stats['tlb_hits']} | TLB Misses: {mem_stats['tlb_misses']}")
+
+        print(f"\nCPU Statistics:")
+        print(f"  Total Time: {self.current_time} units")
+        print(f"  Context Switches: {self.scheduler.context_switches}")
+        print(f"  Completed Processes: {len(self.scheduler.completed_processes)}")
+
+        io_stats = self.io_manager.get_stats()
+        print(f"\nIO Statistics:")
+        print(f"  IO Operations Completed: {io_stats['completed']}")
+
+
+if __name__ == "__main__":
+    os = ComplexOS(physical_memory=256, virtual_memory=1024, scheduling="round_robin")
+
+    os.create_process("SystemDaemon", burst_time=20, memory_required=80, priority=0)
+    os.create_process("WebServer", burst_time=30, memory_required=120, priority=1)
+    os.create_process("UserApp-1", burst_time=25, memory_required=100, priority=2)
+    os.create_process("UserApp-2", burst_time=22, memory_required=95, priority=2)
+    os.create_process("BackgroundTask", burst_time=35, memory_required=110, priority=3)
+
+    os.run(max_cycles=300)
